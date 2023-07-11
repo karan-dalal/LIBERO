@@ -16,4 +16,6 @@ logs/
 *.mp4
 libero.egg-info/
 .vscode/
+
 outputs/
+weights/

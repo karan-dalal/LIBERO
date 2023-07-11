@@ -12,6 +12,7 @@ from warmup_scheduler import GradualWarmupScheduler
 from libero.lifelong.datasets import get_dataset, SequenceVLDataset
 from libero.libero.benchmark import get_benchmark
 from libero.libero import get_libero_path
+from torchsummary import summary
 
 def load_dataset():
     """
@@ -61,11 +62,14 @@ def load_dataset():
 def main(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     OmegaConf.set_struct(cfg, False)
-    ckpt = cfg.pop("ckpt") # Set as CLIP checkpoint path.
+    ckpt = cfg.pop("ckpt")
     OmegaConf.set_struct(cfg, True)
     model = MineCLIP(**cfg).to(device)
-    model.load_ckpt(ckpt.path, strict=True)
+    # model.load_ckpt(ckpt.path, strict=False) # Load CLIP checkpoint.
     model.train()
+
+    for name, module in model.named_children():
+        print(name)
 
     dataset = load_dataset()
     dataloader = DataLoader(dataset, batch_size=64, shuffle=True) # Batch size of 64 / GPU.
@@ -87,13 +91,13 @@ def main(cfg):
 
     TODO: Similar as above. Weird configuration.
     """
-    parts = [model.image_encoder, model.temporal_encoder, model.clip_model.text_model, model.reward_head]
+    parts = [model.image_encoder, model.temporal_encoder, model.reward_head]
     base_lr = 1.5e-4
     decay = 0.65
     params = []
     for part in parts:
         layers = list(part.children())
-        if part == model.image_encoder or part == model.clip_model.text_model:
+        if part == model.image_encoder or part == model.reward_head:
             lr = base_lr / 2
         else:
             lr = base_lr
