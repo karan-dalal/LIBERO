@@ -1,28 +1,61 @@
 import torch
+import os
 import hydra
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 from arch import MineCLIP
 from warmup_scheduler import GradualWarmupScheduler
 
+from libero.lifelong.datasets import get_dataset, SequenceVLDataset
+from libero.libero.benchmark import get_benchmark
+from libero.libero import get_libero_path
+
 def load_dataset():
     """
-    Load dataset here. 
-
-    They sample 640K pairs of 16-second video snippets + time-aligned English transcripts:
-    1. They gather a list of popular keywords in Minecraft and search through transcripts to find 640K text segments that match.
-    2. They randomly "grow" their text segement to 16 ~ 77 tokens by adding words before and after.
-    3. They randomly sample a timestep within their text-video segment and grow it to 8 ~ 16 seconds.
-    4. They sample 16 RGB frames from their video segment uniformly.
-
-    Lastly, they apply data agumentation via a temporally-consistent random resized crop.
+    Load dataset here.
     """
-    dataset = VideoDataset(videos)
-    return videos
+    name = "libero_spatial"
+    datasets_default_path = get_libero_path("datasets")
+
+    benchmark = get_benchmark(name)(0)
+    tasks = benchmark.n_tasks
+
+    manip_datasets = []
+    descriptions = []
+
+    for i in range(tasks):
+        try:
+            task_i_dataset, shape_meta = get_dataset(
+                dataset_path=os.path.join(
+                    datasets_default_path, benchmark.get_task_demonstration(i)
+                ),
+                obs_modality={'rgb': ['agentview_rgb']},
+                initialize_obs_utils=(i == 0),
+                seq_len=10,
+            )
+        except Exception as e:
+            print(
+                f"[error] failed to load task {i} name {benchmark.get_task_names()[i]}"
+            )
+            print(f"[error] {e}")
+        
+        task_description = benchmark.get_task(i).language
+        descriptions.append(task_description)
+        manip_datasets.append(task_i_dataset)
+
+    datasets = [
+        SequenceVLDataset(ds, descrip) for (ds, descrip) in zip(manip_datasets, descriptions)
+    ]
+    concat_dataset = ConcatDataset([ds for ds in datasets]) # TODO: Figure out the right way to concatenate datasets.
+    
+    print('======== DATASET INFORMATION ========')
+    print('Number of tasks:', len(concat_dataset))
+    print('Number of demontrations per task:', [ds.n_demos for ds in datasets])
+
+    return concat_dataset
 
 @hydra.main(config_name="conf", config_path="main/", version_base="1.1")
 def main(cfg):
@@ -31,7 +64,7 @@ def main(cfg):
     ckpt = cfg.pop("ckpt") # Set as CLIP checkpoint path.
     OmegaConf.set_struct(cfg, True)
     model = MineCLIP(**cfg).to(device)
-    # model.load_ckpt(ckpt.path, strict=True)
+    model.load_ckpt(ckpt.path, strict=True)
     model.train()
 
     dataset = load_dataset()
@@ -52,15 +85,15 @@ def main(cfg):
     """
     Pre-trained layers get 0.5x learning rate multiplier. We also have a 0.65 layer learning rate decay. 
 
-    TODO: Similar as above. Weird configuration, currently treating reward_head as text_model. Also, check if this works :)
+    TODO: Similar as above. Weird configuration.
     """
-    parts = [model.image_encoder, model.temporal_encoder, model.reward_head]
+    parts = [model.image_encoder, model.temporal_encoder, model.clip_model.text_model, model.reward_head]
     base_lr = 1.5e-4
     decay = 0.65
     params = []
     for part in parts:
         layers = list(part.children())
-        if part == model.image_encoder or part == model.reward_head:
+        if part == model.image_encoder or part == model.clip_model.text_model:
             lr = base_lr / 2
         else:
             lr = base_lr
