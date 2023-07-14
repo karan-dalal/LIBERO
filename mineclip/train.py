@@ -9,6 +9,7 @@ from arch import MineCLIP
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from warmup_scheduler import GradualWarmupScheduler
 from torch.utils.data import DataLoader, ConcatDataset
@@ -64,6 +65,12 @@ class MineCLIPSystem(pl.LightningModule):
         self.model = model
         self.cfg = cfg
 
+    def forward(self, obs, text):
+        video_features = self.model.encode_video(obs)
+        text_tokens = self.model.encode_text(text)
+        logits_per_video, logits_per_text = self.model.forward_reward_head(video_features, text_tokens)
+        return logits_per_video, logits_per_text
+
     def freeze_layers(self):
         for child in list(self.model.clip_model.vision_model.children())[:-2]:
             for param in child.parameters():
@@ -106,7 +113,7 @@ class MineCLIPSystem(pl.LightningModule):
         scheduler_cosine = CosineAnnealingLR(optimizer, T_max=2)
         scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=500, after_scheduler=scheduler_cosine)
 
-        return (optimizer,), (scheduler,)
+        return ([optimizer], [scheduler])
 
 
 @hydra.main(config_name="conf", config_path="main/", version_base="1.1")
@@ -122,12 +129,14 @@ def train(cfg):
     model = MineCLIP(**cfg).to(device)
     model.load_ckpt(ckpt.path, strict=False)
     system = MineCLIPSystem(model, cfg)
+    logger = TensorBoardLogger('tensorboard', name='robo_clip')
+    lr_monitor = LearningRateMonitor(logging_interval='step')
 
     # View layers of the MineCLIP Model.
     # system.configure_optimizers()
-    # summary(system.model, input_size=(16, 16, 3, 160, 265), mode='train', device = device, verbose=1, col_names=["trainable", "output_size", "num_params"],)
+    # summary(system.model, input_size=(16, 16, 3, 128, 128), mode='train', device = device, verbose=1, col_names=["trainable", "input_size", "output_size", "num_params"],)
 
-    trainer = Trainer(callbacks=[LearningRateMonitor()], max_epochs=2) 
+    trainer = Trainer(logger=logger, callbacks=[lr_monitor], max_epochs=2, log_every_n_steps=0) 
     trainer.fit(system, train_dataloader)
 
 if __name__ == "__main__":

@@ -1,11 +1,13 @@
 import copy
-
+import torch
 import numpy as np
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 from PIL import Image
 from robomimic.utils.dataset import SequenceDataset
 from torch.utils.data import Dataset
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
 
 """
     Helper function from Robomimic to read hdf5 demonstrations into sequence dataset
@@ -60,17 +62,43 @@ def get_dataset(
 
 
 class SequenceVLDataset(Dataset):
-    def __init__(self, sequence_dataset, task_emb):
+    def __init__(self, sequence_dataset, task_emb, aug=True, color_aug_prob=0.3):
         self.sequence_dataset = sequence_dataset
         self.task_emb = task_emb
         self.n_demos = self.sequence_dataset.n_demos
         self.total_num_sequences = self.sequence_dataset.total_num_sequences
+        self.color_aug_prob = color_aug_prob
+        self.aug = aug
+        if aug is True:
+            self.translate_aug = T.RandomResizedCrop(
+                        size=128,
+                        scale=(0.8, 1.0),
+                        interpolation=InterpolationMode.BILINEAR,
+                    )
+            self.color_aug = T.ColorJitter(
+                        brightness=0.3,
+                        contrast=0.3,
+                        saturation=0.3,
+                        hue=0.1,
+                    )
+        else:
+            self.translate_aug, self.color_aug = None, None
 
     def __len__(self):
         return len(self.sequence_dataset)
 
     def __getitem__(self, idx):
         return_dict = self.sequence_dataset.__getitem__(idx)
+        if self.aug is True:
+            for k, v in return_dict['obs'].items():
+                if 'rgb' in k:
+                    v = torch.from_numpy(v)
+                    v = self.translate_aug(v)
+                    if np.random.rand() < self.color_aug_prob:
+                        v = self.color_aug(v)
+                    v = v.numpy()
+                    return_dict['obs'][k] = v
+        
         return_dict["task_emb"] = self.task_emb
         return return_dict
 
