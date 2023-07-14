@@ -1,23 +1,23 @@
-import torch
 import os
+import torch
 import hydra
+import pytorch_lightning as pl
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from omegaconf import OmegaConf
-from arch import MineCLIP
-from warmup_scheduler import GradualWarmupScheduler
 
+from arch import MineCLIP 
+from omegaconf import OmegaConf
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import LearningRateMonitor
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from warmup_scheduler import GradualWarmupScheduler
+from torch.utils.data import DataLoader, ConcatDataset
 from libero.lifelong.datasets import get_dataset, SequenceVLDataset
 from libero.libero.benchmark import get_benchmark
 from libero.libero import get_libero_path
-from torchsummary import summary
+from torchinfo import summary
 
 def load_dataset():
-    """
-    Load dataset here.
-    """
     name = "libero_spatial"
     datasets_default_path = get_libero_path("datasets")
 
@@ -35,7 +35,7 @@ def load_dataset():
                 ),
                 obs_modality={'rgb': ['agentview_rgb']},
                 initialize_obs_utils=(i == 0),
-                seq_len=10,
+                seq_len=16,
             )
         except Exception as e:
             print(
@@ -50,85 +50,85 @@ def load_dataset():
     datasets = [
         SequenceVLDataset(ds, descrip) for (ds, descrip) in zip(manip_datasets, descriptions)
     ]
-    concat_dataset = ConcatDataset([ds for ds in datasets]) # TODO: Figure out the right way to concatenate datasets.
     
     print('======== DATASET INFORMATION ========')
-    print('Number of tasks:', len(concat_dataset))
+    print('Number of tasks:', len(datasets))
     print('Number of demontrations per task:', [ds.n_demos for ds in datasets])
 
+    concat_dataset = ConcatDataset(datasets)
     return concat_dataset
 
+class MineCLIPSystem(pl.LightningModule):
+    def __init__(self, model, cfg):
+        super().__init__()
+        self.model = model
+        self.cfg = cfg
+
+    def freeze_layers(self):
+        for child in list(self.model.clip_model.vision_model.children())[:-2]:
+            for param in child.parameters():
+                param.requires_grad = False
+        
+        for child in list(self.model.clip_model.text_model.children())[:-2]:
+            for param in child.parameters():
+                param.requires_grad = False
+    
+    def training_step(self, batch, batch_idx):
+        obs, text = batch["obs"]["agentview_rgb"], batch["task_emb"]
+        logits_per_video, logits_per_text = self(obs, text)
+        
+        logit_scale = self.model.clip_model.logit_scale.exp()
+        sim_matrix = logit_scale * logits_per_video @ logits_per_text.t()
+        loss = (-torch.diag(F.log_softmax(sim_matrix, dim=-1))).mean()
+        
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+    
+    def configure_optimizers(self):
+        self.freeze_layers()
+
+        # Add layerwise learning rate decay to the image encoder, text model, and temporal encoder. 
+        # NOTE: Check if the learning rate of the same layer is the same.
+        param_groups = [self.model.clip_model.vision_model, self.model.clip_model.text_model, self.model.temporal_encoder]
+        base_lr = 1.5e-4
+        decay = 0.65
+        params = []
+        for i, group in enumerate(param_groups):
+            layers = list(reversed(list(group.children())))
+            lr = base_lr / 2 if i != 2 else base_lr
+            for i, layer in enumerate(layers):
+                params.append({'params': layer.parameters(), 'lr': lr * (decay ** i)})
+
+        # Add base learning rate with no decay to the reward head.
+        params.append({'params': self.model.reward_head.parameters(), 'lr': base_lr})
+
+        optimizer = optim.AdamW(self.parameters(), weight_decay=0.2)
+        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=2)
+        scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=500, after_scheduler=scheduler_cosine)
+
+        return (optimizer,), (scheduler,)
+
+
 @hydra.main(config_name="conf", config_path="main/", version_base="1.1")
-def main(cfg):
+def train(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset = load_dataset()
+    train_dataloader = DataLoader(dataset, batch_size=64, shuffle=True) 
+
     OmegaConf.set_struct(cfg, False)
     ckpt = cfg.pop("ckpt")
     OmegaConf.set_struct(cfg, True)
+
     model = MineCLIP(**cfg).to(device)
-    # model.load_ckpt(ckpt.path, strict=False) # Load CLIP checkpoint.
-    model.train()
+    model.load_ckpt(ckpt.path, strict=False)
+    system = MineCLIPSystem(model, cfg)
 
-    for name, module in model.named_children():
-        print(name)
+    # View layers of the MineCLIP Model.
+    # system.configure_optimizers()
+    # summary(system.model, input_size=(16, 16, 3, 160, 265), mode='train', device = device, verbose=1, col_names=["trainable", "output_size", "num_params"],)
 
-    dataset = load_dataset()
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True) # Batch size of 64 / GPU.
-
-    """
-    Freeze image encoder and text encoder except for final 2 layers.
-
-    TODO: Paper and code do not align for image and text encoder placement. Also, check if this works.
-    """
-    for child in list(model.image_encoder.children())[:-2]:
-        for param in child.parameters():
-            param.requires_grad = False
-    for child in list(model.clip_model.text_model.children())[:-2]:
-        for param in child.parameters():
-            param.requires_grad = False
-
-    """
-    Pre-trained layers get 0.5x learning rate multiplier. We also have a 0.65 layer learning rate decay. 
-
-    TODO: Similar as above. Weird configuration.
-    """
-    parts = [model.image_encoder, model.temporal_encoder, model.reward_head]
-    base_lr = 1.5e-4
-    decay = 0.65
-    params = []
-    for part in parts:
-        layers = list(part.children())
-        if part == model.image_encoder or part == model.reward_head:
-            lr = base_lr / 2
-        else:
-            lr = base_lr
-        for i, layer in enumerate(layers):
-            params.append({'params': layer.parameters(), 'lr': lr * (decay ** i)})
-
-    optimizer = optim.AdamW(params, weight_decay=0.2) # Which optimizer do they use?
-    scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-5) 
-    scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=500, after_scheduler=scheduler_cosine)
-
-    for epoch in range(2): # Run for 2 epochs.
-        for batch in dataloader:
-            video, text = batch["video"].to(device), batch["text"]
-            
-            optimizer.zero_grad()
-
-            video_features = model.encode_video(video)
-            text_tokens = model.encode_text(text)
-            logits_per_video, logits_per_text = model.forward_reward_head(video_features, text_tokens)
-
-            # InfoNCE loss... Do we include negative pairs?
-            logit_scale = model.clip_model.logit_scale.exp()
-            sim_matrix = logit_scale * logits_per_video @ logits_per_text.t()
-            loss = (-torch.diag(F.log_softmax(sim_matrix, dim=-1))).mean()
-
-
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-        print(f"Finished epoch {epoch+1} with loss {loss.item()}")
+    trainer = Trainer(callbacks=[LearningRateMonitor()], max_epochs=2) 
+    trainer.fit(system, train_dataloader)
 
 if __name__ == "__main__":
-    main()
+    train()

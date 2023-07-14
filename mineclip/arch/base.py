@@ -55,6 +55,7 @@ class VideoRewardBase(nn.Module):
         """
         B, L, F = image_features.size()
         video_feats = self.temporal_encoder(image_features)
+        print(video_feats.shape)
         assert video_feats.shape[0] == B
         return video_feats
 
