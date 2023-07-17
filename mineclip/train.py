@@ -65,12 +65,6 @@ class MineCLIPSystem(pl.LightningModule):
         self.model = model
         self.cfg = cfg
 
-    def forward(self, obs, text):
-        video_features = self.model.encode_video(obs)
-        text_tokens = self.model.encode_text(text)
-        logits_per_video, logits_per_text = self.model.forward_reward_head(video_features, text_tokens)
-        return logits_per_video, logits_per_text
-
     def freeze_layers(self):
         for child in list(self.model.clip_model.vision_model.children())[:-2]:
             for param in child.parameters():
@@ -84,11 +78,14 @@ class MineCLIPSystem(pl.LightningModule):
         obs, text = batch["obs"]["agentview_rgb"], batch["task_emb"]
         logits_per_video, logits_per_text = self(obs, text)
         
-        logit_scale = self.model.clip_model.logit_scale.exp()
-        sim_matrix = logit_scale * logits_per_video @ logits_per_text.t()
-        loss = (-torch.diag(F.log_softmax(sim_matrix, dim=-1))).mean()
-        
+        labels = torch.arange(logits_per_video.shape[0])
+        loss_fn = torch.nn.CrossEntropyLoss()
+        image_loss = loss_fn(logits_per_video, labels)  
+        text_loss = loss_fn(logits_per_text, labels)
+        loss = (image_loss + text_loss) / 2
+
         self.log("train_loss", loss, prog_bar=True)
+        self.clamp_logit_scale()
         return loss
     
     def configure_optimizers(self):
@@ -132,7 +129,7 @@ def train(cfg):
     logger = TensorBoardLogger('tensorboard', name='robo_clip')
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
-    # View layers of the MineCLIP Model.
+    #View layers of the MineCLIP Model.
     # system.configure_optimizers()
     # summary(system.model, input_size=(16, 16, 3, 128, 128), mode='train', device = device, verbose=1, col_names=["trainable", "input_size", "output_size", "num_params"],)
 
