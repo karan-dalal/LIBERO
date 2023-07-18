@@ -132,7 +132,7 @@ def train(cfg):
     ckpt = cfg.pop("ckpt")
     OmegaConf.set_struct(cfg, True)
 
-    model = MineCLIP(**cfg)
+    model = MineCLIP(**cfg).to(device)
     model.load_ckpt(ckpt.path, strict=False)
     system = MineCLIPSystem(model, cfg)
     logger = TensorBoardLogger('tensorboard', name='robo_clip')
