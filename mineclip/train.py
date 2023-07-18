@@ -4,6 +4,7 @@ import hydra
 import pytorch_lightning as pl
 import torch.optim as optim
 import torch.nn.functional as F
+import re
 
 from arch import MineCLIP 
 from omegaconf import OmegaConf
@@ -66,13 +67,15 @@ class MineCLIPSystem(pl.LightningModule):
         self.cfg = cfg
 
     def freeze_layers(self):
-        for child in list(self.model.clip_model.vision_model.children())[:-2]:
-            for param in child.parameters():
-                param.requires_grad = False
-        
-        for child in list(self.model.clip_model.text_model.children())[:-2]:
-            for param in child.parameters():
-                param.requires_grad = False
+        for name, param in self.model.clip_model.vision_model.named_parameters():
+            if name.startswith("blocks.11"):
+                break
+            param.requires_grad = False
+            
+        for name, param in self.model.clip_model.text_model.named_parameters():
+            if name.startswith("blocks.11"):
+                break
+            param.requires_grad = False 
     
     def training_step(self, batch, batch_idx):
         obs, text = batch["obs"]["agentview_rgb"], batch["task_emb"]
@@ -89,24 +92,30 @@ class MineCLIPSystem(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        self.freeze_layers()
+        self.freeze_layers() # Freeze pre-trained layers
 
-        # Add layerwise learning rate decay to the image encoder, text model, and temporal encoder. 
-        # NOTE: Check if the learning rate of the same layer is the same.
-        param_groups = [self.model.clip_model.vision_model, self.model.clip_model.text_model, self.model.temporal_encoder]
+        params = []
+        groups = [self.model.clip_model.vision_model, self.model.clip_model.text_model, self.model.temporal_encoder, self.model.reward_head]
         base_lr = 1.5e-4
         decay = 0.65
-        params = []
-        for i, group in enumerate(param_groups):
-            layers = list(reversed(list(group.children())))
-            lr = base_lr / 2 if i != 2 else base_lr
-            for i, layer in enumerate(layers):
-                params.append({'params': layer.parameters(), 'lr': lr * (decay ** i)})
+        
+        for i, group in enumerate(groups):
+            layers = list(reversed(list(group.named_parameters())))
+            lr = base_lr / 2 if i < 2 else base_lr # Half learning rate for pre-trained layers
+            prev_layer_name = layers[0][0].split('.')[0]
 
-        # Add base learning rate with no decay to the reward head.
-        params.append({'params': self.model.reward_head.parameters(), 'lr': base_lr})
+            for idx, (name, param) in enumerate(layers):
+                if i < 2: # Layerwise decay if image encoder or text model
+                    curr_layer_name = name.split('.')[0] if name.split('.')[0] != 'blocks' else '.'.join(name.split('.')[:2])
+                    if curr_layer_name != prev_layer_name:
+                        lr *= decay
+                        prev_layer_name = curr_layer_name   
 
-        optimizer = optim.AdamW(self.parameters(), weight_decay=0.2)
+                if param.requires_grad and not (name.startswith('clip_model') and i == 3): # Exclude reward head from including image encoder and text model parameters
+                    # print(name, lr)
+                    params.append({'params': param, 'lr': lr})
+    
+        optimizer = optim.AdamW(params, weight_decay=0.2)
         scheduler_cosine = CosineAnnealingLR(optimizer, T_max=2)
         scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=500, after_scheduler=scheduler_cosine)
 
@@ -123,13 +132,13 @@ def train(cfg):
     ckpt = cfg.pop("ckpt")
     OmegaConf.set_struct(cfg, True)
 
-    model = MineCLIP(**cfg).to(device)
+    model = MineCLIP(**cfg)
     model.load_ckpt(ckpt.path, strict=False)
     system = MineCLIPSystem(model, cfg)
     logger = TensorBoardLogger('tensorboard', name='robo_clip')
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
-    #View layers of the MineCLIP Model.
+    # View layers of the MineCLIP Model. NOTE: Must change 'text' for test.
     # system.configure_optimizers()
     # summary(system.model, input_size=(16, 16, 3, 128, 128), mode='train', device = device, verbose=1, col_names=["trainable", "input_size", "output_size", "num_params"],)
 
