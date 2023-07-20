@@ -11,7 +11,7 @@ pool_type: ???  # filled by variant
 resolution: [128, 128]
 
 ckpt:
-  path: '/data/yusun/karan/LIBERO/mineclip/weights/clip.pt'  # filled by users
+  path: '/weights/clip.pt'  # filled by users
   checksum: ???
 
 hydra:

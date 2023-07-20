@@ -3,12 +3,11 @@ import torch
 import hydra
 import pytorch_lightning as pl
 import torch.optim as optim
-import torch.nn.functional as F
-import re
 
 from arch import MineCLIP 
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -66,6 +65,11 @@ class MineCLIPSystem(pl.LightningModule):
         self.model = model
         self.cfg = cfg
 
+    def train_dataloader(self):
+        dataset = load_dataset()
+        train_dataloader = DataLoader(dataset, batch_size=64, shuffle=True) 
+        return train_dataloader
+
     def freeze_layers(self):
         for name, param in self.model.clip_model.vision_model.named_parameters():
             if name.startswith("blocks.11"):
@@ -76,63 +80,76 @@ class MineCLIPSystem(pl.LightningModule):
             if name.startswith("blocks.11"):
                 break
             param.requires_grad = False 
+
+    def forward(self, obs, text):        
+        logits_per_video, logits_per_text = self.model(obs, text)
+        return logits_per_video, logits_per_text
     
     def training_step(self, batch, batch_idx):
         obs, text = batch["obs"]["agentview_rgb"], batch["task_emb"]
-        logits_per_video, logits_per_text = self(obs, text)
+        logits_per_video, logits_per_text = self.forward(obs, text)
         
-        labels = torch.arange(logits_per_video.shape[0])
+        labels = torch.arange(logits_per_video.shape[0], device=self.device)
         loss_fn = torch.nn.CrossEntropyLoss()
         image_loss = loss_fn(logits_per_video, labels)  
         text_loss = loss_fn(logits_per_text, labels)
         loss = (image_loss + text_loss) / 2
 
         self.log("train_loss", loss, prog_bar=True)
-        self.clamp_logit_scale()
+        self.model.clamp_logit_scale()
         return loss
     
     def configure_optimizers(self):
         self.freeze_layers() # Freeze pre-trained layers
 
         params = []
-        groups = [self.model.clip_model.vision_model, self.model.clip_model.text_model, self.model.temporal_encoder, self.model.reward_head]
-        base_lr = 1.5e-4
+        groups = [self.model.temporal_encoder, self.model.reward_head] # Reward head contains image encoder and text model parameters
+        peak_lr = 1.5e-4
+        final_lr = 1e-5
+        weight_decay=0.2
         decay = 0.65
         
+        dataset_size = len(self.train_dataloader().dataset)
+        batch_size = self.train_dataloader().batch_size
+        num_steps_per_epoch = dataset_size // batch_size
+        total_steps = 2 * num_steps_per_epoch
+
+        normal_param_group = []
+        clip_param_group = []
+        layer_param_group = []
+
         for i, group in enumerate(groups):
             layers = list(reversed(list(group.named_parameters())))
-            lr = base_lr / 2 if i < 2 else base_lr # Half learning rate for pre-trained layers
-            prev_layer_name = layers[0][0].split('.')[0]
+            for (name, param) in layers:
+                if name.startswith('clip_model'):
+                    if name.startswith('clip_model.vision_model.blocks.11') or name.startswith('clip_model.text_model.blocks.11'):
+                        layer_param_group.append(param)
+                    else:
+                        clip_param_group.append(param)
+                else:
+                    normal_param_group.append(param)
 
-            for idx, (name, param) in enumerate(layers):
-                if i < 2: # Layerwise decay if image encoder or text model
-                    curr_layer_name = name.split('.')[0] if name.split('.')[0] != 'blocks' else '.'.join(name.split('.')[:2])
-                    if curr_layer_name != prev_layer_name:
-                        lr *= decay
-                        prev_layer_name = curr_layer_name   
+        param_groups = [
+            {'params': normal_param_group, 'lr': peak_lr},
+            {'params': clip_param_group, 'lr': peak_lr * 0.5},
+            {'params': layer_param_group, 'lr': peak_lr * 0.5 * decay},
+        ]
+        optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
 
-                if param.requires_grad and not (name.startswith('clip_model') and i == 3): # Exclude reward head from including image encoder and text model parameters
-                    # print(name, lr)
-                    params.append({'params': param, 'lr': lr})
-    
-        optimizer = optim.AdamW(params, weight_decay=0.2)
-        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=2)
-        scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=500, after_scheduler=scheduler_cosine)
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=final_lr) # NOTE: Not using decay on final learning rate.
 
-        return ([optimizer], [scheduler])
+        # NOTE: Warmup not implemented.
+
+        return ([optimizer], [{'scheduler': scheduler, 'interval': 'step'}])
 
 
 @hydra.main(config_name="conf", config_path="main/", version_base="1.1")
 def train(cfg):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = load_dataset()
-    train_dataloader = DataLoader(dataset, batch_size=64, shuffle=True) 
-
     OmegaConf.set_struct(cfg, False)
     ckpt = cfg.pop("ckpt")
     OmegaConf.set_struct(cfg, True)
 
-    model = MineCLIP(**cfg).to(device)
+    model = MineCLIP(**cfg)
     model.load_ckpt(ckpt.path, strict=False)
     system = MineCLIPSystem(model, cfg)
     logger = TensorBoardLogger('tensorboard', name='robo_clip')
@@ -142,8 +159,8 @@ def train(cfg):
     # system.configure_optimizers()
     # summary(system.model, input_size=(16, 16, 3, 128, 128), mode='train', device = device, verbose=1, col_names=["trainable", "input_size", "output_size", "num_params"],)
 
-    trainer = Trainer(logger=logger, callbacks=[lr_monitor], max_epochs=2, log_every_n_steps=0) 
-    trainer.fit(system, train_dataloader)
+    trainer = Trainer(logger=logger, callbacks=[lr_monitor], max_epochs=2, log_every_n_steps=1, strategy=DDPStrategy(find_unused_parameters=True))  # FIGURE THIS SHIT OUT.
+    trainer.fit(system)
 
 if __name__ == "__main__":
     train()
