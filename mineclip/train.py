@@ -12,7 +12,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from warmup_scheduler import GradualWarmupScheduler
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, RandomSampler
 from libero.lifelong.datasets import get_dataset, SequenceVLDataset
 from libero.libero.benchmark import get_benchmark
 from libero.libero import get_libero_path
@@ -67,7 +67,7 @@ class MineCLIPSystem(pl.LightningModule):
 
     def train_dataloader(self):
         dataset = load_dataset()
-        train_dataloader = DataLoader(dataset, batch_size=64, shuffle=True) 
+        train_dataloader = DataLoader(dataset, batch_size=64, sampler=RandomSampler(dataset)) 
         return train_dataloader
 
     def freeze_layers(self):
