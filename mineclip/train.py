@@ -3,8 +3,6 @@ import torch
 import hydra
 import pytorch_lightning as pl
 import torch.optim as optim
-import wandb
-import yaml
 
 from arch import MineCLIP 
 from omegaconf import OmegaConf

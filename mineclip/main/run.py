@@ -1,9 +1,49 @@
+import os
 import torch
 import hydra
+from torch.utils.data import DataLoader, ConcatDataset, RandomSampler
+from libero.lifelong.datasets import get_dataset, SequenceVLDataset
+from libero.libero.benchmark import get_benchmark
+from libero.libero import get_libero_path
 from omegaconf import OmegaConf
-
 from arch import MineCLIP
 
+def load_dataset():
+    name = "libero_spatial"
+    datasets_default_path = get_libero_path("datasets")
+
+    benchmark = get_benchmark(name)(0)
+    tasks = benchmark.n_tasks
+
+    manip_datasets = []
+    descriptions = []
+
+    for i in range(tasks):
+        try:
+            task_i_dataset, shape_meta = get_dataset(
+                dataset_path=os.path.join(
+                    datasets_default_path, benchmark.get_task_demonstration(i)
+                ),
+                obs_modality={'rgb': ['agentview_rgb']},
+                initialize_obs_utils=(i == 0),
+                seq_len=16,
+            )
+        except Exception as e:
+            print(
+                f"[error] failed to load task {i} name {benchmark.get_task_names()[i]}"
+            )
+            print(f"[error] {e}")
+        
+        task_description = benchmark.get_task(i).language
+        descriptions.append(task_description)
+        manip_datasets.append(task_i_dataset)
+
+    
+    print('======== DATASET INFORMATION ========')
+    print('Number of tasks:', len(manip_datasets))
+
+    return descriptions, manip_datasets
+    
 
 @torch.no_grad()
 @hydra.main(config_name="conf", config_path=".", version_base="1.1")
@@ -11,52 +51,27 @@ def main(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     OmegaConf.set_struct(cfg, False)
     cfg.pop("ckpt")
+    cfg.pop("wandb")
     OmegaConf.set_struct(cfg, True)
 
     model = MineCLIP(**cfg).to(device)
+    model.load_state_dict(torch.load('model/model_spatial.pth')) # Load model weights
 
-    video = torch.randint(0, 255, (6, 16, 3, 160, 256), device=device)
-    prompts = [
-        "hello, this is MineCLIP",
-        "MineCLIP is a VideoCLIP model trained on YouTube dataset from MineDojo's knowledge base",
-        "Feel free to also checkout MineDojo at",
-        "https://minedojo.org",
-    ]
-    VIDEO_BATCH, TEXT_BATCH = video.size(0), len(prompts)
+    prompts, manip_datasets = load_dataset()
+    videos = torch.stack([torch.tensor(video[0]['obs']['agentview_rgb']) for video in manip_datasets]).to(device) # Select all the videos.
 
-    image_feats = model.forward_image_features(video)
-    video_feats = model.forward_video_features(image_feats)
-    assert video_feats.shape == (VIDEO_BATCH, 512)
-    video_feats_2 = model.encode_video(video)
-    # encode_video is equivalent to forward_video_features(forward_image_features(video))
-    torch.testing.assert_allclose(video_feats, video_feats_2)
+    # videos = torch.tensor(manip_datasets[1][0]['obs']['agentview_rgb']).unsqueeze(0).to(device) # Select the first video.
 
-    # encode batch of prompts
-    text_feats_batch = model.encode_text(prompts)
-    assert text_feats_batch.shape == (TEXT_BATCH, 512)
+    print(videos.shape)
+    print(len(prompts))
+    print(prompts)
 
-    # compute reward from features
-    logits_per_video, logits_per_text = model.forward_reward_head(
-        video_feats, text_tokens=text_feats_batch
+    reward, _ = model(
+        videos, text_tokens=prompts, is_video_features=False
     )
-    assert logits_per_video.shape == (VIDEO_BATCH, TEXT_BATCH)
-    assert logits_per_text.shape == (TEXT_BATCH, VIDEO_BATCH)
-    # directly pass in strings. This invokes the tokenizer under the hood
-    reward_scores_2, _ = model.forward_reward_head(video_feats, text_tokens=prompts)
-    # pass in cached, encoded text features
-    reward_scores_3, _ = model(
-        video_feats, text_tokens=text_feats_batch, is_video_features=True
-    )
-    reward_scores_4, _ = model(
-        video, text_tokens=text_feats_batch, is_video_features=False
-    )
-    # all above are equivalent, just starting from features or raw values
-    torch.testing.assert_allclose(logits_per_video, reward_scores_2)
-    torch.testing.assert_allclose(logits_per_video, reward_scores_3)
-    torch.testing.assert_allclose(logits_per_video, reward_scores_4)
 
-    print("Inference successful")
-
+    print("----Rewards----")
+    print(reward)
 
 if __name__ == "__main__":
     main()
