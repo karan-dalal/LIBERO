@@ -20,3 +20,5 @@ libero.egg-info/
 outputs/
 weights/
 tensorboard/
+wandb/
+logs/

@@ -3,13 +3,15 @@ import torch
 import hydra
 import pytorch_lightning as pl
 import torch.optim as optim
+import wandb
+import yaml
 
 from arch import MineCLIP 
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from warmup_scheduler import GradualWarmupScheduler
 from torch.utils.data import DataLoader, ConcatDataset, RandomSampler
@@ -18,8 +20,9 @@ from libero.libero.benchmark import get_benchmark
 from libero.libero import get_libero_path
 from torchinfo import summary
 
+
 def load_dataset():
-    name = "libero_spatial"
+    name = "libero_90"
     datasets_default_path = get_libero_path("datasets")
 
     benchmark = get_benchmark(name)(0)
@@ -88,7 +91,15 @@ class MineCLIPSystem(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         obs, text = batch["obs"]["agentview_rgb"], batch["task_emb"]
         logits_per_video, logits_per_text = self.forward(obs, text)
-        
+
+        # INFOSCE OBJECTIVE
+        # batch_size = logits_per_video.size(0)
+        # pos_logits = torch.diag(logits_per_video) + torch.diag(logits_per_text)
+        # full_logits = logits_per_video + logits_per_text
+        # neg_logits = full_logits - 2 * torch.diag(torch.diag(full_logits))
+        # neg_sum = torch.logsumexp(neg_logits, dim=1)
+        # loss = - torch.mean(pos_logits - neg_sum)
+
         labels = torch.arange(logits_per_video.shape[0], device=self.device)
         loss_fn = torch.nn.CrossEntropyLoss()
         image_loss = loss_fn(logits_per_video, labels)  
@@ -102,7 +113,6 @@ class MineCLIPSystem(pl.LightningModule):
     def configure_optimizers(self):
         self.freeze_layers() # Freeze pre-trained layers
 
-        params = []
         groups = [self.model.temporal_encoder, self.model.reward_head] # Reward head contains image encoder and text model parameters
         peak_lr = 1.5e-4
         final_lr = 1e-5
@@ -118,7 +128,7 @@ class MineCLIPSystem(pl.LightningModule):
         clip_param_group = []
         layer_param_group = []
 
-        for i, group in enumerate(groups):
+        for group in groups:
             layers = list(reversed(list(group.named_parameters())))
             for (name, param) in layers:
                 if name.startswith('clip_model'):
@@ -147,20 +157,22 @@ class MineCLIPSystem(pl.LightningModule):
 def train(cfg):
     OmegaConf.set_struct(cfg, False)
     ckpt = cfg.pop("ckpt")
+    wandb_config = cfg.pop("wandb")
     OmegaConf.set_struct(cfg, True)
 
     model = MineCLIP(**cfg)
     model.load_ckpt(ckpt.path, strict=False)
     system = MineCLIPSystem(model, cfg)
-    logger = TensorBoardLogger('tensorboard', name='robo_clip')
+    wandb_logger = WandbLogger(project=wandb_config.project_name, name=wandb_config.run_name)
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
     # View layers of the MineCLIP Model. NOTE: Must change 'text' for test.
     # system.configure_optimizers()
     # summary(system.model, input_size=(16, 16, 3, 128, 128), mode='train', device = device, verbose=1, col_names=["trainable", "input_size", "output_size", "num_params"],)
 
-    trainer = Trainer(logger=logger, callbacks=[lr_monitor], max_epochs=2, log_every_n_steps=1, strategy=DDPStrategy(find_unused_parameters=True))  # FIGURE THIS SHIT OUT.
+    trainer = Trainer(logger=wandb_logger, callbacks=[lr_monitor], max_epochs=2, log_every_n_steps=1, strategy=DDPStrategy(find_unused_parameters=True)) 
     trainer.fit(system)
+    torch.save(system.model.state_dict(), '/nlp/scr/yusun/data/model/model_spatial.pth')
 
 if __name__ == "__main__":
     train()
