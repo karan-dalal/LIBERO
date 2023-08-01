@@ -22,7 +22,7 @@ from torchinfo import summary
 
 
 def load_dataset():
-    name = "libero_spatial"
+    name = "libero_90"
     datasets_default_path = get_libero_path("datasets")
 
     benchmark = get_benchmark(name)(0)
