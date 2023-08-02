@@ -1,12 +1,15 @@
 import os
 import torch
 import hydra
+import matplotlib.pyplot as plt
+import seaborn as sns
 from torch.utils.data import DataLoader, ConcatDataset, RandomSampler
 from libero.lifelong.datasets import get_dataset, SequenceVLDataset
 from libero.libero.benchmark import get_benchmark
 from libero.libero import get_libero_path
 from omegaconf import OmegaConf
 from arch import MineCLIP
+from sklearn.metrics.pairwise import cosine_similarity
 
 def load_dataset():
     name = "libero_spatial"
@@ -58,18 +61,33 @@ def main(cfg):
     model.load_state_dict(torch.load('model/model_spatial.pth')) # Load model weights
 
     prompts, manip_datasets = load_dataset()
-    videos = torch.stack([torch.tensor(video[0]['obs']['agentview_rgb']) for video in manip_datasets]).to(device) # Select all the videos.
+    videos = torch.stack([torch.tensor(video[0]['obs']['agentview_rgb']) for video in manip_datasets]).to(device) # Select all the videos
 
-    # videos = torch.tensor(manip_datasets[1][0]['obs']['agentview_rgb']).unsqueeze(0).to(device) # Select the first video.
+    # Plot embedding similarity
+    vid_embeddings = model.encode_video(videos).cpu().numpy()
+    text_embeddings = model.encode_text(prompts).cpu().numpy()
 
-    print(videos.shape)
-    print(len(prompts))
-    print(prompts)
+    similarity_matrix = cosine_similarity(vid_embeddings)
+    plt.figure(figsize=(10, 10))
+    sns.heatmap(similarity_matrix, annot=True, cmap='viridis', fmt='.3f')
+    plt.title('Video Embeddings Cosine Similarity Matrix')
+    plt.xlabel('Embedding Index')
+    plt.ylabel('Embedding Index')
+    plt.savefig('graphs/vid_embd.pdf')
+    plt.clf()
+    
+    similarity_matrix = cosine_similarity(text_embeddings)
+    plt.figure(figsize=(10, 10))
+    sns.heatmap(similarity_matrix, annot=True, cmap='viridis', fmt='.3f')
+    plt.title('Text Embeddings Cosine Similarity Matrix')
+    plt.xlabel('Embedding Index')
+    plt.ylabel('Embedding Index')
+    plt.savefig('graphs/text_embd.pdfç')
 
+    # Compute rewards
     reward, _ = model(
         videos, text_tokens=prompts, is_video_features=False
     )
-
     print("----Rewards----")
     print(reward)
 

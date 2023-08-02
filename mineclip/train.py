@@ -90,14 +90,6 @@ class MineCLIPSystem(pl.LightningModule):
         obs, text = batch["obs"]["agentview_rgb"], batch["task_emb"]
         logits_per_video, logits_per_text = self.forward(obs, text)
 
-        # INFOSCE OBJECTIVE
-        # batch_size = logits_per_video.size(0)
-        # pos_logits = torch.diag(logits_per_video) + torch.diag(logits_per_text)
-        # full_logits = logits_per_video + logits_per_text
-        # neg_logits = full_logits - 2 * torch.diag(torch.diag(full_logits))
-        # neg_sum = torch.logsumexp(neg_logits, dim=1)
-        # loss = - torch.mean(pos_logits - neg_sum)
-
         labels = torch.arange(logits_per_video.shape[0], device=self.device)
         loss_fn = torch.nn.CrossEntropyLoss()
         image_loss = loss_fn(logits_per_video, labels)  
